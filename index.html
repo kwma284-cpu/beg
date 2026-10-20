@@ -1,0 +1,117 @@
+-- بوابة قطاع برق الأمني | الصق هذا كله في Supabase > SQL Editor ثم Run
+
+create table members(
+  user_id uuid primary key references auth.users on delete cascade,
+  discord_id text not null, username text, nick text, avatar text,
+  roles text[] not null default '{}', unit text,
+  allowed boolean not null default false, active_role text,
+  checked_at timestamptz not null default now());
+create table officer_units(username text primary key, unit text not null, discord_id text);
+create table requests(
+  id bigint generated always as identity primary key,
+  owner uuid not null references auth.users on delete cascade,
+  kind text not null check (kind in ('tk','cp','lv','tr','dq')),
+  unit text, who text, sum text, data jsonb not null default '[]',
+  priority int not null default 1, status text not null default 'جديد',
+  created_at timestamptz not null default now());
+create table notifications(
+  id bigint generated always as identity primary key,
+  user_id uuid not null references auth.users on delete cascade,
+  type text not null, request_id bigint, req_type text, req_sum text,
+  by_role text, priority int, read boolean not null default false,
+  created_at timestamptz not null default now());
+create table activity_log(
+  id bigint generated always as identity primary key,
+  at timestamptz not null default now(),
+  user_id uuid, who text, role text, type text, text text);
+
+alter table members enable row level security;
+alter table officer_units enable row level security;
+alter table requests enable row level security;
+alter table notifications enable row level security;
+alter table activity_log enable row level security;
+
+-- المستخدم يعتبر مؤهلاً فقط إذا تم فحص رتبته من ديسكورد خلال آخر 7 دقائق
+create or replace function me() returns setof members language sql security definer stable set search_path=public as $$
+  select * from members where user_id=auth.uid() and allowed and checked_at>now()-interval '7 minutes' $$;
+create or replace function is_ok() returns boolean language sql security definer stable set search_path=public as $$
+  select exists(select 1 from me()) $$;
+create or replace function is_lead() returns boolean language sql security definer stable set search_path=public as $$
+  select coalesce((select active_role in ('aff','hq') from me()),false) $$;
+create or replace function officer_unit() returns text language sql security definer stable set search_path=public as $$
+  select case when active_role='off' then unit end from me() $$;
+
+create or replace function role_name(k text) returns text language sql immutable as $$
+  select case k when 'spec' then 'القوات الخاصة لأمن الطرق' when 'pat' then 'الإدارة العامة لدوريات الأمن'
+  when 'aff' then 'شؤون قوى الأمن الداخلي' when 'hq' then 'القيادة العليا لقطاع برق الأمني'
+  when 'off' then 'الضباط' else k end $$;
+create or replace function kind_name(k text) returns text language sql immutable as $$
+  select case k when 'tk' then 'التكميل' when 'cp' then 'رفع شكوى' when 'lv' then 'طلب إجازة'
+  when 'tr' then 'طلب نقل' when 'dq' then 'المداقشة' else k end $$;
+
+-- قواعد من يشوف وش
+create policy m_sel on members for select using (user_id=auth.uid());
+create policy r_sel on requests for select using (
+  is_ok() and (owner=auth.uid() or is_lead()
+  or (kind in ('lv','tr','dq') and unit is not null and unit=officer_unit())));
+create policy n_sel on notifications for select using (is_ok() and user_id=auth.uid());
+create policy l_sel on activity_log for select using (is_lead());
+
+create or replace function set_active_role(p_role text) returns void language plpgsql security definer set search_path=public as $$
+declare m members; begin
+  select * into m from me(); if m.user_id is null then raise exception 'not allowed'; end if;
+  if not (p_role = any(m.roles)) then raise exception 'role not held'; end if;
+  if m.active_role is distinct from p_role then
+    insert into activity_log(user_id,who,role,type,text) values (m.user_id,m.nick,role_name(p_role),
+      case when m.active_role is null then 'in' else 'dec' end,
+      case when m.active_role is null then 'دخل البوابة' else 'بدّل رتبته إلى '||role_name(p_role) end);
+    update members set active_role=p_role where user_id=m.user_id;
+  end if; end $$;
+
+create or replace function submit_request(p_kind text,p_unit text,p_who text,p_sum text,p_data jsonb) returns bigint
+language plpgsql security definer set search_path=public as $$
+declare m members; rid bigint; begin
+  select * into m from me(); if m.user_id is null then raise exception 'not allowed'; end if;
+  insert into requests(owner,kind,unit,who,sum,data) values (m.user_id,p_kind,
+    coalesce(m.unit, case when p_unit in ('spec','pat') then p_unit end),left(p_who,100),left(p_sum,500),p_data)
+    returning id into rid;
+  insert into activity_log(user_id,who,role,type,text) values (m.user_id,m.nick,role_name(m.active_role),'send','أرسل '||kind_name(p_kind));
+  return rid; end $$;
+
+create or replace function decide_request(p_id bigint,p_status text) returns void language plpgsql security definer set search_path=public as $$
+declare m members; r requests; begin
+  if not is_lead() then raise exception 'not allowed'; end if;
+  if p_status not in ('مقبول','مرفوض') then raise exception 'bad status'; end if;
+  select * into m from me();
+  update requests set status=p_status where id=p_id returning * into r;
+  insert into notifications(user_id,type,request_id,req_type,req_sum,by_role,priority)
+    values (r.owner,case p_status when 'مقبول' then 'ok' else 'no' end,r.id,kind_name(r.kind),r.sum,role_name(m.active_role),r.priority);
+  insert into activity_log(user_id,who,role,type,text) values (m.user_id,m.nick,role_name(m.active_role),'dec',
+    (case p_status when 'مقبول' then 'قبل ' else 'رفض ' end)||kind_name(r.kind)||' لـ '||r.who); end $$;
+
+create or replace function set_priority(p_id bigint,p_pr int) returns void language plpgsql security definer set search_path=public as $$
+declare m members; r requests; begin
+  if not is_lead() then raise exception 'not allowed'; end if;
+  if p_pr not between 1 and 3 then raise exception 'bad priority'; end if;
+  select * into m from me();
+  update requests set priority=p_pr where id=p_id returning * into r;
+  insert into notifications(user_id,type,request_id,req_type,req_sum,by_role,priority)
+    values (r.owner,'pr',r.id,kind_name(r.kind),r.sum,role_name(m.active_role),p_pr);
+  insert into activity_log(user_id,who,role,type,text) values (m.user_id,m.nick,role_name(m.active_role),'dec',
+    'غيّر أهمية '||kind_name(r.kind)||' لـ '||r.who||' إلى '||(array['عادي','مهم','عاجل'])[p_pr]); end $$;
+
+create or replace function mark_read() returns void language sql security definer set search_path=public as $$
+  update notifications set read=true where user_id=auth.uid() $$;
+
+create or replace function log_out() returns void language plpgsql security definer set search_path=public as $$
+declare m members; t timestamptz; begin
+  select * into m from members where user_id=auth.uid(); if m.user_id is null then return; end if;
+  select at into t from activity_log where user_id=m.user_id and type='in' order by at desc limit 1;
+  insert into activity_log(user_id,who,role,type,text) values (m.user_id,m.nick,role_name(m.active_role),'out',
+    'خرج من البوابة · مدة الجلسة '||greatest(1,round(extract(epoch from now()-coalesce(t,now()))/60))||' دقيقة');
+  update members set active_role=null where user_id=m.user_id; end $$;
+
+-- يوزرات الضباط (القوات الخاصة لأمن الطرق = spec | الإدارة العامة لدوريات الأمن = pat)
+insert into officer_units(username,unit) values
+  ('n.xr1','spec'),('sd_2w','spec'),('rk.1k','spec'),
+  ('y048318','pat'),('.0_fk','pat');
